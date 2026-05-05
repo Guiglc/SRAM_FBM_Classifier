@@ -1,0 +1,1031 @@
+# sram_pattern_classifier.py
+# Python 3.7+
+#
+# Usage:
+#   python sram_pattern_classifier.py input.csv --outdir output
+#   python sram_pattern_classifier.py input.xlsx --outdir output
+#
+# Input required columns:
+#   lot_id, wafer_id, test_time, device#, diex, diey, macro,
+#   testname, condition, address_dec, fail_bit, physical_x, physical_y
+
+import argparse
+import os
+from collections import Counter, defaultdict, deque
+
+import pandas as pd
+
+
+DEFAULT_GROUP_COLS = [
+    "lot_id",
+    "wafer_id",
+    "test_time",
+    "device#",
+    "diex",
+    "diey",
+    "macro",
+    "testname",
+    "condition",
+]
+
+
+class SRAMPatternClassifier:
+    def __init__(
+        self,
+        macro_cols=512,
+        macro_rows=512,
+        macro_block_ratio=0.30,
+        swr_ratio=0.40,
+        sbc_ratio=0.40,
+        partial_min_len=5,
+        block_min_size=15,
+        block_aspect_low=0.8,
+        block_aspect_high=1.2,
+        block_fill_ratio=0.60,
+        periodic_min_points=5,
+        periodic_ratio=0.70,
+        periodic_offset_tol=1,
+        periodic_min_lines=1,
+        random_density_threshold=100,
+        connectivity=8,
+    ):
+        self.macro_cols = macro_cols
+        self.macro_rows = macro_rows
+
+        self.macro_block_ratio = macro_block_ratio
+        self.swr_ratio = swr_ratio
+        self.sbc_ratio = sbc_ratio
+        self.partial_min_len = partial_min_len
+
+        self.block_min_size = block_min_size
+        self.block_aspect_low = block_aspect_low
+        self.block_aspect_high = block_aspect_high
+        self.block_fill_ratio = block_fill_ratio
+
+        self.periodic_min_points = periodic_min_points
+        self.periodic_ratio = periodic_ratio
+        self.periodic_offset_tol = periodic_offset_tol
+        self.periodic_min_lines = periodic_min_lines
+
+        self.random_density_threshold = random_density_threshold
+        self.connectivity = connectivity
+
+        self.pattern_defs = {
+            "MBLK": ( "MACRO_BLOCK"    , 1  , "BLOCK"       , "宏块"   ) ,
+            "PDIC": ( "PERIODIC"       , 2  , "GEOMETRY"    , "周期性"  ) ,
+            "SWR":  (  "SWR"            , 3  , "LINE-ROW"    , "单行"   ) ,
+            "SBC": (  "SBC"            , 3  , "LINE-COLUMN" , "单列"   ) ,
+            "PWR": (  "PWR"            , 4  , "LINE-ROW"    , "部分行"  ) ,
+            "PBC": (  "PBC"            , 4  , "LINE-COLUMN" , "部分列"  ) ,
+            "MWR": (  "MWR"            , 5  , "LINE-ROW"    , "多行"   ) ,
+            "MBC": (  "MBC"            , 5  , "LINE-COLUMN" , "多列"   ) ,
+            "CRS": (  "CROSS"          , 6  , "CROSS"       , "交叉"   ) ,
+            "BLK": (  "BLOCK"          , 7  , "BLOCK"       , "块"    ) ,
+            "QB": (   "QUADRA_BIT"     , 8  , "BLOCK"       , "四点块"  ) ,
+            "RCLU": ( "RANDOM_CLUSTER" , 9  , "RANDOM"      , "随机簇"  ) ,
+            "SB": (   "SB"             , 10 , "SINGLE"      , "单点"   ) ,
+            "DBR": (  "DBR"            , 10 , "LINE-DOUBLE" , "双行"   ) ,
+            "DBC": (  "DBC"            , 10 , "LINE-DOUBLE" , "双列"   ) ,
+            "L": (    "L-shape"        , 10 , "L-shape"     , "L形"   ) ,
+            "RDEN": ( "RANDOM_DENSITY" , 11 , "RANDOM"      , "整体随机" ) ,
+            "UNCL": ( "UNCLASSIFIED"   , 99 , "UNKNOWN"     , "未分类"  ) ,
+        }
+
+    # -----------------------------
+    # Public API
+    # -----------------------------
+    def classify_dataframe(self, df, group_cols=None):
+        if group_cols is None:
+            group_cols = [c for c in DEFAULT_GROUP_COLS if c in df.columns]
+
+        self._validate_columns(df)
+
+        all_pattern_rows = []
+        all_labeled_rows = []
+
+        for group_key, g in df.groupby(group_cols, dropna=False):
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+
+            group_info = dict(zip(group_cols, group_key))
+
+            pattern_rows, point_label_map = self.classify_one_macro(g, group_info)
+
+            all_pattern_rows.extend(pattern_rows)
+
+            labeled_g = g.copy()
+            labels = []
+            codes = []
+            pattern_ids = []
+
+            for _, row in labeled_g.iterrows():
+                p = (int(row["physical_x"]), int(row["physical_y"]))
+                item = point_label_map.get(p)
+
+                if item is None:
+                    labels.append("UNCLASSIFIED")
+                    codes.append("UNCL")
+                    pattern_ids.append("")
+                else:
+                    labels.append(item["name"])
+                    codes.append(item["code"])
+                    pattern_ids.append(item["pattern_id"])
+
+            labeled_g["pattern_name"] = labels
+            labeled_g["pattern_code"] = codes
+            labeled_g["pattern_id"] = pattern_ids
+
+            all_labeled_rows.append(labeled_g)
+
+        summary_df = pd.DataFrame(all_pattern_rows)
+
+        if all_labeled_rows:
+            labeled_df = pd.concat(all_labeled_rows, ignore_index=True)
+        else:
+            labeled_df = pd.DataFrame()
+
+        return summary_df, labeled_df
+
+    def classify_one_macro(self, g, group_info):
+        points = []
+        for _, row in g.iterrows():
+            points.append((int(row["physical_x"]), int(row["physical_y"])))
+
+        points = sorted(set(points))
+        remaining = set(points)
+
+        pattern_rows = []
+        point_label_map = {}
+        pattern_index = 1
+
+        def add_pattern(code, pts, extra=None, consume=True):
+            nonlocal pattern_index, remaining, pattern_rows, point_label_map
+
+            pts = sorted(set(pts))
+            if not pts and code != "RDEN":
+                return None
+
+            name, priority, level1, level2 = self.pattern_defs[code]
+            pattern_id = self._make_pattern_id(group_info, pattern_index, code)
+            pattern_index += 1
+
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+
+            row = {}
+            row.update(group_info)
+            row.update({
+                "pattern_id": pattern_id,
+                "priority": priority,
+                "level1": level1,
+                "level2": level2,
+                "pattern_name": name,
+                "pattern_code": code,
+                "fail_count": len(pts),
+                "xmin": min(xs) if xs else None,
+                "xmax": max(xs) if xs else None,
+                "ymin": min(ys) if ys else None,
+                "ymax": max(ys) if ys else None,
+            })
+
+            if extra:
+                row.update(extra)
+
+            pattern_rows.append(row)
+
+            if consume:
+                for p in pts:
+                    if p in remaining:
+                        remaining.remove(p)
+
+                    if p not in point_label_map:
+                        point_label_map[p] = {
+                            "pattern_id": pattern_id,
+                            "name": name,
+                            "code": code,
+                        }
+
+            return pattern_id
+
+        # 1. MACRO_BLOCK
+        comps = self._connected_components(remaining)
+        for comp in comps:
+            if len(comp) / float(self.macro_cols * self.macro_rows) >= self.macro_block_ratio:
+                add_pattern(
+                    "MBLK",
+                    comp,
+                    extra={
+                        "rule": "connected_component_fail_count / macro_total_bits >= %.3f" % self.macro_block_ratio
+                    },
+                    consume=True,
+                )
+
+        # 2. PERIODIC
+        periodic_groups = self._detect_periodic_groups(remaining)
+        for pg in periodic_groups:
+            add_pattern(
+                "PDIC",
+                pg["points"],
+                extra={
+                    "axis": pg["axis"],
+                    "period": pg["period"],
+                    "offset": pg["offset"],
+                    "line_start": min(pg["lines"]),
+                    "line_end": max(pg["lines"]),
+                    "line_count": len(pg["lines"]),
+                    "rule": "single WL/BL periodic, then adjacent periodic lines merged",
+                },
+                consume=True,
+            )
+
+        # 3-6. LINE and CROSS
+        line_patterns = self._detect_line_patterns(remaining)
+
+        row_patterns = [p for p in line_patterns if p["kind"] in ("SWR", "PWR", "MWR")]
+        col_patterns = [p for p in line_patterns if p["kind"] in ("SBC", "PBC", "MBC")]
+
+        used_line_pattern_ids = set()
+
+        cross_patterns = self._detect_cross_patterns(row_patterns, col_patterns)
+
+        for cp in cross_patterns:
+            add_pattern(
+                "CRS",
+                cp["points"],
+                extra={
+                    "row_pattern": cp["row_kind"],
+                    "col_pattern": cp["col_kind"],
+                    "rule": "row-line pattern intersects column-line pattern",
+                },
+                consume=True,
+            )
+            used_line_pattern_ids.add(cp["row_id"])
+            used_line_pattern_ids.add(cp["col_id"])
+
+        for lp in line_patterns:
+            if lp["id"] in used_line_pattern_ids:
+                continue
+
+            if any(p not in remaining for p in lp["points"]):
+                continue
+
+            add_pattern(
+                lp["kind"],
+                lp["points"],
+                extra=lp.get("extra"),
+                consume=True,
+            )
+
+        # 7. BLOCK
+        comps = self._connected_components(remaining)
+        for comp in comps:
+            if self._is_block(comp):
+                add_pattern(
+                    "BLK",
+                    comp,
+                    extra=self._block_extra(comp),
+                    consume=True,
+                )
+
+        # 8. QUADRA_BIT
+        comps = self._connected_components(remaining)
+        for comp in comps:
+            if self._is_quadra_bit(comp):
+                add_pattern("QB", comp, consume=True)
+
+        # 9. RANDOM_CLUSTER
+        comps = self._connected_components(remaining)
+        for comp in comps:
+            if len(comp) >= 4:
+                add_pattern(
+                    "RCLU",
+                    comp,
+                    extra={"rule": "component size >= 4 and not line / quadra / block"},
+                    consume=True,
+                )
+
+        # 10. SB / DBR / DBC / L
+        comps = self._connected_components(remaining)
+        for comp in comps:
+            if self._is_sb(comp):
+                add_pattern("SB", comp, consume=True)
+            elif self._is_dbr(comp):
+                add_pattern("DBR", comp, consume=True)
+            elif self._is_dbc(comp):
+                add_pattern("DBC", comp, consume=True)
+            elif self._is_l_shape(comp):
+                add_pattern("L", comp, consume=True)
+            else:
+                add_pattern("UNCL", comp, consume=True)
+
+        # 11. RANDOM_DENSITY
+        random_like_codes = set(["SB", "DBR", "DBC", "QB", "L", "RCLU"])
+        random_like_count = 0
+        for r in pattern_rows:
+            if r["pattern_code"] in random_like_codes:
+                random_like_count += 1
+
+        if random_like_count > self.random_density_threshold:
+            add_pattern(
+                "RDEN",
+                [],
+                extra={
+                    "random_like_component_count": random_like_count,
+                    "threshold": self.random_density_threshold,
+                    "rule": "SB/DBR/DBC/QB/L/RANDOM_CLUSTER component count exceeds threshold",
+                },
+                consume=False,
+            )
+
+        return pattern_rows, point_label_map
+
+    # -----------------------------
+    # Validation
+    # -----------------------------
+    def _validate_columns(self, df):
+        required = ["physical_x", "physical_y"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError("Missing required columns: %s" % missing)
+
+    # -----------------------------
+    # Pattern ID
+    # -----------------------------
+    def _make_pattern_id(self, group_info, index, code):
+        keys = []
+        for k in ["lot_id", "wafer_id", "diex", "diey", "macro", "testname", "condition"]:
+            if k in group_info:
+                keys.append(str(group_info[k]))
+        return "%s_%s_%04d" % ("|".join(keys), code, index)
+
+    # -----------------------------
+    # Connected component
+    # -----------------------------
+    def _neighbors(self, p):
+        x, y = p
+
+        if self.connectivity == 4:
+            offsets = [
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+            ]
+        else:
+            offsets = [
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1),
+            ]
+
+        for dx, dy in offsets:
+            yield (x + dx, y + dy)
+
+    def _connected_components(self, points):
+        points = set(points)
+        visited = set()
+        comps = []
+
+        for p in list(points):
+            if p in visited:
+                continue
+
+            q = deque([p])
+            visited.add(p)
+            comp = []
+
+            while q:
+                cur = q.popleft()
+                comp.append(cur)
+
+                for nb in self._neighbors(cur):
+                    if nb in points and nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+
+            comps.append(comp)
+
+        return comps
+
+    # -----------------------------
+    # PERIODIC
+    # -----------------------------
+    def _detect_periodic_groups(self, points):
+        points = set(points)
+
+        row_map = defaultdict(list)
+        col_map = defaultdict(list)
+
+        for x, y in points:
+            row_map[y].append(x)
+            col_map[x].append(y)
+
+        periodic_lines = []
+
+        # axis = WL means: within the same WL, x direction is periodic
+        for y, xs in row_map.items():
+            result = self._detect_period_in_values(xs)
+            if result is not None:
+                period, offset, selected_values, ratio = result
+                pts = [(x, y) for x in selected_values if (x, y) in points]
+                if pts:
+                    periodic_lines.append({
+                        "axis": "WL",
+                        "line": y,
+                        "period": period,
+                        "offset": offset,
+                        "ratio": ratio,
+                        "points": pts,
+                    })
+
+        # axis = BL means: within the same BL, y direction is periodic
+        for x, ys in col_map.items():
+            result = self._detect_period_in_values(ys)
+            if result is not None:
+                period, offset, selected_values, ratio = result
+                pts = [(x, y) for y in selected_values if (x, y) in points]
+                if pts:
+                    periodic_lines.append({
+                        "axis": "BL",
+                        "line": x,
+                        "period": period,
+                        "offset": offset,
+                        "ratio": ratio,
+                        "points": pts,
+                    })
+
+        groups = []
+        by_axis = defaultdict(list)
+
+        for line in periodic_lines:
+            by_axis[line["axis"]].append(line)
+
+        for axis, lines in by_axis.items():
+            lines = sorted(lines, key=lambda d: d["line"])
+
+            current = None
+
+            for line in lines:
+                if current is None:
+                    current = {
+                        "axis": axis,
+                        "period": line["period"],
+                        "offset": line["offset"],
+                        "lines": [line["line"]],
+                        "points": list(line["points"]),
+                    }
+                    continue
+
+                prev_line = current["lines"][-1]
+                same_period = line["period"] == current["period"]
+                adjacent_line = line["line"] == prev_line + 1
+                offset_close = self._offset_close(
+                    current["offset"],
+                    line["offset"],
+                    current["period"],
+                    self.periodic_offset_tol,
+                )
+
+                if same_period and adjacent_line and offset_close:
+                    current["lines"].append(line["line"])
+                    current["points"].extend(line["points"])
+                else:
+                    if len(current["lines"]) >= self.periodic_min_lines:
+                        groups.append(current)
+
+                    current = {
+                        "axis": axis,
+                        "period": line["period"],
+                        "offset": line["offset"],
+                        "lines": [line["line"]],
+                        "points": list(line["points"]),
+                    }
+
+            if current is not None and len(current["lines"]) >= self.periodic_min_lines:
+                groups.append(current)
+
+        return groups
+
+    def _detect_period_in_values(self, values):
+        values = sorted(set(int(v) for v in values))
+
+        if len(values) < self.periodic_min_points:
+            return None
+
+        diffs = []
+        for i in range(1, len(values)):
+            d = values[i] - values[i - 1]
+            if d > 1:
+                diffs.append(d)
+
+        if not diffs:
+            return None
+
+        cnt = Counter(diffs)
+        period, main_count = cnt.most_common(1)[0]
+
+        if period <= 1:
+            return None
+
+        ratio = main_count / float(len(values) - 1)
+
+        if ratio < self.periodic_ratio:
+            return None
+
+        offset = values[0] % period
+
+        selected_values = []
+        for v in values:
+            if self._offset_close(offset, v % period, period, self.periodic_offset_tol):
+                selected_values.append(v)
+
+        if len(selected_values) < self.periodic_min_points:
+            return None
+
+        return period, offset, selected_values, ratio
+
+    def _offset_close(self, a, b, period, tol):
+        diff = abs(a - b)
+        diff = min(diff, period - diff)
+        return diff <= tol
+
+    # -----------------------------
+    # LINE / CROSS
+    # -----------------------------
+    def _detect_line_patterns(self, points):
+        points = set(points)
+
+        row_map = defaultdict(list)
+        col_map = defaultdict(list)
+
+        for x, y in points:
+            row_map[y].append(x)
+            col_map[x].append(y)
+
+        base_rows = []
+        base_cols = []
+
+        # SWR / PWR
+        for y, xs in row_map.items():
+            xs = sorted(set(xs))
+            coverage = len(xs) / float(self.macro_cols)
+
+            if coverage >= self.swr_ratio:
+                row_points = [(x, y) for x in xs]
+                base_rows.append({
+                    "kind": "SWR",
+                    "line": y,
+                    "points": row_points,
+                    "range_min": min(xs),
+                    "range_max": max(xs),
+                    "extra": {
+                        "axis": "WL",
+                        "line": y,
+                        "coverage": coverage,
+                        "rule": "row fail count / total BL >= %.3f" % self.swr_ratio,
+                    },
+                })
+            else:
+                segments = self._continuous_segments(xs)
+                long_segments = [seg for seg in segments if len(seg) > self.partial_min_len]
+                if long_segments:
+                    selected = []
+                    for seg in long_segments:
+                        selected.extend(seg)
+                    selected = sorted(set(selected))
+
+                    row_points = [(x, y) for x in selected]
+                    base_rows.append({
+                        "kind": "PWR",
+                        "line": y,
+                        "points": row_points,
+                        "range_min": min(selected),
+                        "range_max": max(selected),
+                        "extra": {
+                            "axis": "WL",
+                            "line": y,
+                            "coverage": coverage,
+                            "max_segment_len": max(len(seg) for seg in long_segments),
+                            "rule": "continuous segment length > %d and coverage < %.3f"
+                                    % (self.partial_min_len, self.swr_ratio),
+                        },
+                    })
+
+        # SBC / PBC
+        for x, ys in col_map.items():
+            ys = sorted(set(ys))
+            coverage = len(ys) / float(self.macro_rows)
+
+            if coverage >= self.sbc_ratio:
+                col_points = [(x, y) for y in ys]
+                base_cols.append({
+                    "kind": "SBC",
+                    "line": x,
+                    "points": col_points,
+                    "range_min": min(ys),
+                    "range_max": max(ys),
+                    "extra": {
+                        "axis": "BL",
+                        "line": x,
+                        "coverage": coverage,
+                        "rule": "column fail count / total WL >= %.3f" % self.sbc_ratio,
+                    },
+                })
+            else:
+                segments = self._continuous_segments(ys)
+                long_segments = [seg for seg in segments if len(seg) > self.partial_min_len]
+                if long_segments:
+                    selected = []
+                    for seg in long_segments:
+                        selected.extend(seg)
+                    selected = sorted(set(selected))
+
+                    col_points = [(x, y) for y in selected]
+                    base_cols.append({
+                        "kind": "PBC",
+                        "line": x,
+                        "points": col_points,
+                        "range_min": min(selected),
+                        "range_max": max(selected),
+                        "extra": {
+                            "axis": "BL",
+                            "line": x,
+                            "coverage": coverage,
+                            "max_segment_len": max(len(seg) for seg in long_segments),
+                            "rule": "continuous segment length > %d and coverage < %.3f"
+                                    % (self.partial_min_len, self.sbc_ratio),
+                        },
+                    })
+
+        patterns = []
+        pid = 1
+
+        # MWR
+        row_groups = self._group_adjacent_lines(base_rows)
+        used_base_row_ids = set()
+
+        for group in row_groups:
+            if len(group) >= 2:
+                pts = []
+                lines = []
+                kinds = []
+
+                for item in group:
+                    pts.extend(item["points"])
+                    lines.append(item["line"])
+                    kinds.append(item["kind"])
+                    used_base_row_ids.add(id(item))
+
+                patterns.append({
+                    "id": "line_%04d" % pid,
+                    "kind": "MWR",
+                    "points": sorted(set(pts)),
+                    "line_min": min(lines),
+                    "line_max": max(lines),
+                    "range_min": min(min(i["range_min"] for i in group), max(i["range_min"] for i in group)),
+                    "range_max": max(i["range_max"] for i in group),
+                    "extra": {
+                        "axis": "WL",
+                        "line_start": min(lines),
+                        "line_end": max(lines),
+                        "line_count": len(lines),
+                        "sub_kinds": ",".join(sorted(set(kinds))),
+                        "rule": ">=2 adjacent WL satisfy SWR or PWR",
+                    },
+                })
+                pid += 1
+
+        # MBC
+        col_groups = self._group_adjacent_lines(base_cols)
+        used_base_col_ids = set()
+
+        for group in col_groups:
+            if len(group) >= 2:
+                pts = []
+                lines = []
+                kinds = []
+
+                for item in group:
+                    pts.extend(item["points"])
+                    lines.append(item["line"])
+                    kinds.append(item["kind"])
+                    used_base_col_ids.add(id(item))
+
+                patterns.append({
+                    "id": "line_%04d" % pid,
+                    "kind": "MBC",
+                    "points": sorted(set(pts)),
+                    "line_min": min(lines),
+                    "line_max": max(lines),
+                    "range_min": min(i["range_min"] for i in group),
+                    "range_max": max(i["range_max"] for i in group),
+                    "extra": {
+                        "axis": "BL",
+                        "line_start": min(lines),
+                        "line_end": max(lines),
+                        "line_count": len(lines),
+                        "sub_kinds": ",".join(sorted(set(kinds))),
+                        "rule": ">=2 adjacent BL satisfy SBC or PBC",
+                    },
+                })
+                pid += 1
+
+        # single row lines not included in MWR
+        for item in base_rows:
+            if id(item) in used_base_row_ids:
+                continue
+
+            patterns.append({
+                "id": "line_%04d" % pid,
+                "kind": item["kind"],
+                "points": item["points"],
+                "line_min": item["line"],
+                "line_max": item["line"],
+                "range_min": item["range_min"],
+                "range_max": item["range_max"],
+                "extra": item["extra"],
+            })
+            pid += 1
+
+        # single column lines not included in MBC
+        for item in base_cols:
+            if id(item) in used_base_col_ids:
+                continue
+
+            patterns.append({
+                "id": "line_%04d" % pid,
+                "kind": item["kind"],
+                "points": item["points"],
+                "line_min": item["line"],
+                "line_max": item["line"],
+                "range_min": item["range_min"],
+                "range_max": item["range_max"],
+                "extra": item["extra"],
+            })
+            pid += 1
+
+        return patterns
+
+    def _continuous_segments(self, values):
+        values = sorted(set(values))
+        if not values:
+            return []
+
+        segments = []
+        cur = [values[0]]
+
+        for v in values[1:]:
+            if v == cur[-1] + 1:
+                cur.append(v)
+            else:
+                segments.append(cur)
+                cur = [v]
+
+        segments.append(cur)
+        return segments
+
+    def _group_adjacent_lines(self, line_items):
+        line_items = sorted(line_items, key=lambda d: d["line"])
+
+        groups = []
+        cur = []
+
+        for item in line_items:
+            if not cur:
+                cur = [item]
+                continue
+
+            if item["line"] == cur[-1]["line"] + 1:
+                cur.append(item)
+            else:
+                groups.append(cur)
+                cur = [item]
+
+        if cur:
+            groups.append(cur)
+
+        return groups
+
+    def _detect_cross_patterns(self, row_patterns, col_patterns):
+        cross = []
+
+        for rp in row_patterns:
+            rset = set(rp["points"])
+
+            for cp in col_patterns:
+                cset = set(cp["points"])
+                inter = rset.intersection(cset)
+
+                if inter:
+                    pts = sorted(rset.union(cset))
+                    cross.append({
+                        "row_id": rp["id"],
+                        "col_id": cp["id"],
+                        "row_kind": rp["kind"],
+                        "col_kind": cp["kind"],
+                        "points": pts,
+                    })
+
+        # avoid duplicate cross patterns that share exactly the same points
+        unique = []
+        seen = set()
+
+        for c in cross:
+            key = tuple(c["points"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(c)
+
+        return unique
+
+    # -----------------------------
+    # BLOCK / QB / Small shape
+    # -----------------------------
+    def _bbox(self, comp):
+        xs = [p[0] for p in comp]
+        ys = [p[1] for p in comp]
+        return min(xs), max(xs), min(ys), max(ys)
+
+    def _is_block(self, comp):
+        size = len(comp)
+
+        if size < self.block_min_size:
+            return False
+
+        xmin, xmax, ymin, ymax = self._bbox(comp)
+        col_span = xmax - xmin + 1
+        row_span = ymax - ymin + 1
+
+        if col_span <= 0 or row_span <= 0:
+            return False
+
+        aspect = row_span / float(col_span)
+
+        if not (self.block_aspect_low < aspect < self.block_aspect_high):
+            return False
+
+        fill_ratio = size / float(row_span * col_span)
+
+        if fill_ratio <= self.block_fill_ratio:
+            return False
+
+        return True
+
+    def _block_extra(self, comp):
+        xmin, xmax, ymin, ymax = self._bbox(comp)
+        col_span = xmax - xmin + 1
+        row_span = ymax - ymin + 1
+        fill_ratio = len(comp) / float(row_span * col_span)
+        aspect = row_span / float(col_span)
+
+        return {
+            "row_span": row_span,
+            "col_span": col_span,
+            "aspect": aspect,
+            "fill_ratio": fill_ratio,
+            "rule": "size >= %d, %.2f < row_span/col_span < %.2f, fill_ratio > %.2f"
+                    % (
+                        self.block_min_size,
+                        self.block_aspect_low,
+                        self.block_aspect_high,
+                        self.block_fill_ratio,
+                    ),
+        }
+
+    def _is_quadra_bit(self, comp):
+        if len(comp) != 4:
+            return False
+
+        xmin, xmax, ymin, ymax = self._bbox(comp)
+
+        if xmax - xmin + 1 != 2:
+            return False
+
+        if ymax - ymin + 1 != 2:
+            return False
+
+        expected = set([
+            (xmin, ymin),
+            (xmin, ymax),
+            (xmax, ymin),
+            (xmax, ymax),
+        ])
+
+        return set(comp) == expected
+
+    def _is_sb(self, comp):
+        return len(comp) == 1
+
+    def _is_dbr(self, comp):
+        if len(comp) != 2:
+            return False
+
+        pts = list(comp)
+        x1, y1 = pts[0]
+        x2, y2 = pts[1]
+
+        return y1 == y2 and abs(x1 - x2) == 1
+
+    def _is_dbc(self, comp):
+        if len(comp) != 2:
+            return False
+
+        pts = list(comp)
+        x1, y1 = pts[0]
+        x2, y2 = pts[1]
+
+        return x1 == x2 and abs(y1 - y2) == 1
+
+    def _is_l_shape(self, comp):
+        if len(comp) != 3:
+            return False
+
+        xmin, xmax, ymin, ymax = self._bbox(comp)
+
+        if xmax - xmin + 1 != 2:
+            return False
+
+        if ymax - ymin + 1 != 2:
+            return False
+
+        return True
+
+
+def read_input(path):
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in [".xlsx", ".xls"]:
+        return pd.read_excel(path)
+
+    if ext in [".csv", ".txt"]:
+        return pd.read_csv(path)
+
+    raise ValueError("Unsupported file type: %s" % ext)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input", help="input csv/xlsx file")
+    parser.add_argument("--outdir", default="output", help="output directory")
+
+    parser.add_argument("--macro-cols", type=int, default=512)
+    parser.add_argument("--macro-rows", type=int, default=512)
+
+    parser.add_argument("--macro-block-ratio", type=float, default=0.30)
+    parser.add_argument("--swr-ratio", type=float, default=0.40)
+    parser.add_argument("--sbc-ratio", type=float, default=0.40)
+    parser.add_argument("--partial-min-len", type=int, default=5)
+
+    parser.add_argument("--block-min-size", type=int, default=15)
+    parser.add_argument("--block-fill-ratio", type=float, default=0.60)
+
+    parser.add_argument("--periodic-min-points", type=int, default=5)
+    parser.add_argument("--periodic-ratio", type=float, default=0.70)
+    parser.add_argument("--periodic-offset-tol", type=int, default=1)
+    parser.add_argument("--periodic-min-lines", type=int, default=1)
+
+    parser.add_argument("--random-density-threshold", type=int, default=100)
+
+    args = parser.parse_args()
+
+    df = read_input(args.input)
+
+    clf = SRAMPatternClassifier(
+        macro_cols=args.macro_cols,
+        macro_rows=args.macro_rows,
+        macro_block_ratio=args.macro_block_ratio,
+        swr_ratio=args.swr_ratio,
+        sbc_ratio=args.sbc_ratio,
+        partial_min_len=args.partial_min_len,
+        block_min_size=args.block_min_size,
+        block_fill_ratio=args.block_fill_ratio,
+        periodic_min_points=args.periodic_min_points,
+        periodic_ratio=args.periodic_ratio,
+        periodic_offset_tol=args.periodic_offset_tol,
+        periodic_min_lines=args.periodic_min_lines,
+        random_density_threshold=args.random_density_threshold,
+    )
+
+    summary_df, labeled_df = clf.classify_dataframe(df)
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    summary_path = os.path.join(args.outdir, "pattern_summary.csv")
+    labeled_path = os.path.join(args.outdir, "failbit_labeled.csv")
+
+    summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+    labeled_df.to_csv(labeled_path, index=False, encoding="utf-8-sig")
+
+    print("Done.")
+    print("Pattern summary:", summary_path)
+    print("Failbit labeled:", labeled_path)
+
+
+if __name__ == "__main__":
+    main()
