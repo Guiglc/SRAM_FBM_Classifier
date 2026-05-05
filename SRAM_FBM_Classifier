@@ -71,24 +71,24 @@ class SRAMPatternClassifier:
         self.connectivity = connectivity
 
         self.pattern_defs = {
-            "MBLK": ( "MACRO_BLOCK"    , 1  , "BLOCK"       , "宏块"   ) ,
-            "PDIC": ( "PERIODIC"       , 2  , "GEOMETRY"    , "周期性"  ) ,
-            "SWR":  (  "SWR"            , 3  , "LINE-ROW"    , "单行"   ) ,
-            "SBC": (  "SBC"            , 3  , "LINE-COLUMN" , "单列"   ) ,
-            "PWR": (  "PWR"            , 4  , "LINE-ROW"    , "部分行"  ) ,
-            "PBC": (  "PBC"            , 4  , "LINE-COLUMN" , "部分列"  ) ,
-            "MWR": (  "MWR"            , 5  , "LINE-ROW"    , "多行"   ) ,
-            "MBC": (  "MBC"            , 5  , "LINE-COLUMN" , "多列"   ) ,
-            "CRS": (  "CROSS"          , 6  , "CROSS"       , "交叉"   ) ,
-            "BLK": (  "BLOCK"          , 7  , "BLOCK"       , "块"    ) ,
-            "QB": (   "QUADRA_BIT"     , 8  , "BLOCK"       , "四点块"  ) ,
-            "RCLU": ( "RANDOM_CLUSTER" , 9  , "RANDOM"      , "随机簇"  ) ,
-            "SB": (   "SB"             , 10 , "SINGLE"      , "单点"   ) ,
-            "DBR": (  "DBR"            , 10 , "LINE-DOUBLE" , "双行"   ) ,
-            "DBC": (  "DBC"            , 10 , "LINE-DOUBLE" , "双列"   ) ,
-            "L": (    "L-shape"        , 10 , "L-shape"     , "L形"   ) ,
-            "RDEN": ( "RANDOM_DENSITY" , 11 , "RANDOM"      , "整体随机" ) ,
-            "UNCL": ( "UNCLASSIFIED"   , 99 , "UNKNOWN"     , "未分类"  ) ,
+                "MBLK"   : ( "MACRO_BLOCK"    , 1  , "BLOCK"       ) ,
+                "PDIC"   : ( "PERIODIC"       , 2  , "GEOMETRY"    ) ,
+                "SWR"    : ( "SWR"            , 3  , "LINE-ROW"    ) ,
+                "SBC"    : ( "SBC"            , 3  , "LINE-COLUMN" ) ,
+                "PWR"    : ( "PWR"            , 4  , "LINE-ROW"    ) ,
+                "PBC"    : ( "PBC"            , 4  , "LINE-COLUMN" ) ,
+                "MWR"    : ( "MWR"            , 5  , "LINE-ROW"    ) ,
+                "MBC"    : ( "MBC"            , 5  , "LINE-COLUMN" ) ,
+                "CRS"    : ( "CROSS"          , 6  , "CROSS"       ) ,
+                "BLK"    : ( "BLOCK"          , 7  , "BLOCK"       ) ,
+                "QB"     : ( "QUADRA_BIT"     , 8  , "BLOCK"       ) ,
+                # "RCLU" : ( "RANDOM_CLUSTER" , 9  , "RANDOM"      ) , 
+                "SB"     : ( "SB"             , 10 , "SINGLE"      ) ,
+                "DBR"    : ( "DBR"            , 10 , "LINE-DOUBLE" ) ,
+                "DBC"    : ( "DBC"            , 10 , "LINE-DOUBLE" ) ,
+                "L"      : ( "L-shape"        , 10 , "L-shape"     ) ,
+                "RDEN"   : ( "RANDOM_DENSITY" , 11 , "RANDOM"      ) ,
+                "UNCL"   : ( "UNCLASSIFIED"   , 99 , "UNKNOWN"     ) ,
         }
 
     # -----------------------------
@@ -165,7 +165,7 @@ class SRAMPatternClassifier:
             if not pts and code != "RDEN":
                 return None
 
-            name, priority, level1, level2 = self.pattern_defs[code]
+            name, priority, level1 = self.pattern_defs[code]
             pattern_id = self._make_pattern_id(group_info, pattern_index, code)
             pattern_index += 1
 
@@ -178,7 +178,6 @@ class SRAMPatternClassifier:
                 "pattern_id": pattern_id,
                 "priority": priority,
                 "level1": level1,
-                "level2": level2,
                 "pattern_name": name,
                 "pattern_code": code,
                 "fail_count": len(pts),
