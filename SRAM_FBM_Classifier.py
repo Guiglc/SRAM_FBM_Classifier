@@ -2,8 +2,8 @@
 # Python 3.7+
 #
 # Usage:
-#   python sram_pattern_classifier.py input.csv --outdir output
-#   python sram_pattern_classifier.py input.xlsx --outdir output
+#   1. Set INPUT_PATH below.
+#   2. Run: python SRAM_FBM_Classifier.py
 #
 # Input required columns:
 #   lot_id, wafer_id, test_time, device#, diex, diey, macro,
@@ -14,6 +14,10 @@ import os
 from collections import Counter, defaultdict, deque
 
 import pandas as pd
+
+
+INPUT_PATH = r"AS00706_55HV_277_normal_failbit.csv"
+RESULT_DIR_NAME = "result"
 
 
 DEFAULT_GROUP_COLS = [
@@ -38,7 +42,10 @@ class SRAMPatternClassifier:
         swr_ratio=0.40,
         sbc_ratio=0.40,
         partial_min_len=5,
-        block_min_size=15,
+        cross_min_arm_len=0,
+        dotted_min_points=6,
+        dotted_min_span=20,
+        block_min_size=25,
         block_aspect_low=0.8,
         block_aspect_high=1.2,
         block_fill_ratio=0.60,
@@ -46,7 +53,7 @@ class SRAMPatternClassifier:
         periodic_ratio=0.70,
         periodic_offset_tol=1,
         periodic_min_lines=1,
-        random_density_threshold=100,
+        random_density_threshold=200,
         connectivity=8,
     ):
         self.macro_cols = macro_cols
@@ -56,6 +63,9 @@ class SRAMPatternClassifier:
         self.swr_ratio = swr_ratio
         self.sbc_ratio = sbc_ratio
         self.partial_min_len = partial_min_len
+        self.cross_min_arm_len = cross_min_arm_len
+        self.dotted_min_points = dotted_min_points
+        self.dotted_min_span = dotted_min_span
 
         self.block_min_size = block_min_size
         self.block_aspect_low = block_aspect_low
@@ -82,10 +92,14 @@ class SRAMPatternClassifier:
             "CRS"  : ( "CROSS"          , 6  , "CROSS"       ) ,
             "BLK"  : ( "BLOCK"          , 7  , "BLOCK"       ) ,
             "QB"   : ( "QUADRA_BIT"     , 8  , "BLOCK"       ) ,
-            "RCLU" : ( "RANDOM_CLUSTER" , 9  , "RANDOM"      ) , 
+            "RCLU" : ( "RANDOM_CLUSTER" , 9  , "RANDOM"      ) ,
+            "DWR"  : ( "DOTTED_ROW"     , 9  , "LINE-ROW"    ) ,
+            "DWC"  : ( "DOTTED_COLUMN"  , 9  , "LINE-COLUMN" ) ,
             "SB"   : ( "SB"             , 10 , "SINGLE"      ) ,
             "DBR"  : ( "DBR"            , 10 , "LINE-DOUBLE" ) ,
             "DBC"  : ( "DBC"            , 10 , "LINE-DOUBLE" ) ,
+            "TBR"  : ( "TBR"            , 10 , "LINE-TRIPLE" ) ,
+            "TBC"  : ( "TBC"            , 10 , "LINE-TRIPLE" ) ,
             "L"    : ( "L-shape"        , 10 , "L-shape"     ) ,
             "RDEN" : ( "RANDOM_DENSITY" , 11 , "RANDOM"      ) ,
             "UNCL" : ( "UNCLASSIFIED"   , 99 , "UNKNOWN"     ) ,
@@ -94,7 +108,7 @@ class SRAMPatternClassifier:
     # -----------------------------
     # Public API
     # -----------------------------
-    def classify_dataframe(self, df, group_cols=None):
+    def classify_dataframe(self, df, group_cols=None, show_progress=True):
         if group_cols is None:
             group_cols = [c for c in DEFAULT_GROUP_COLS if c in df.columns]
 
@@ -102,8 +116,16 @@ class SRAMPatternClassifier:
 
         all_pattern_rows = []
         all_labeled_rows = []
+        grouped = df.groupby(group_cols, dropna=False)
+        total_groups = grouped.ngroups
+        processed_groups = 0
+        last_progress_percent = 0
 
-        for group_key, g in df.groupby(group_cols, dropna=False):
+        if show_progress:
+            print("Progress: 0/%d macro (0%%)" % total_groups, end="", flush=True)
+
+        for group_key, g in grouped:
+            processed_groups += 1
             if not isinstance(group_key, tuple):
                 group_key = (group_key,)
 
@@ -137,6 +159,23 @@ class SRAMPatternClassifier:
 
             all_labeled_rows.append(labeled_g)
 
+            if show_progress:
+                progress_percent = int(processed_groups * 100 / total_groups)
+                if progress_percent != last_progress_percent:
+                    print(
+                        "\rProgress: %d/%d macro (%d%%)" % (
+                            processed_groups,
+                            total_groups,
+                            progress_percent,
+                        ),
+                        end="",
+                        flush=True,
+                    )
+                    last_progress_percent = progress_percent
+
+        if show_progress:
+            print()
+
         summary_df = pd.DataFrame(all_pattern_rows)
 
         if all_labeled_rows:
@@ -166,7 +205,7 @@ class SRAMPatternClassifier:
                 return None
 
             name, priority, level1 = self.pattern_defs[code]
-            pattern_id = self._make_pattern_id(group_info, pattern_index, code)
+            pattern_id = self._make_pattern_id(pattern_index)
             pattern_index += 1
 
             xs = [p[0] for p in pts]
@@ -254,12 +293,16 @@ class SRAMPatternClassifier:
                 extra={
                     "row_pattern": cp["row_kind"],
                     "col_pattern": cp["col_kind"],
-                    "rule": "row-line pattern intersects column-line pattern",
+                    "row_arm_span": cp["row_arm_span"],
+                    "col_arm_span": cp["col_arm_span"],
+                    "rule": "SWR/PWR/MWR intersects SBC/PBC/MBC",
                 },
                 consume=True,
             )
             used_line_pattern_ids.add(cp["row_id"])
             used_line_pattern_ids.add(cp["col_id"])
+
+        line_patterns = sorted(line_patterns, key=self._line_pattern_strength, reverse=True)
 
         for lp in line_patterns:
             if lp["id"] in used_line_pattern_ids:
@@ -286,24 +329,37 @@ class SRAMPatternClassifier:
                     consume=True,
                 )
 
-        # 8. QUADRA_BIT
+        # 8. DOTTED LINE
+        dotted_patterns = self._detect_dotted_line_patterns(remaining)
+        for dp in dotted_patterns:
+            if any(p not in remaining for p in dp["points"]):
+                continue
+
+            add_pattern(
+                dp["kind"],
+                dp["points"],
+                extra=dp.get("extra"),
+                consume=True,
+            )
+
+        # 9. QUADRA_BIT
         comps = self._connected_components(remaining)
         for comp in comps:
             if self._is_quadra_bit(comp):
                 add_pattern("QB", comp, consume=True)
 
-        # 9. RANDOM_CLUSTER
+        # 10. RANDOM_CLUSTER
         comps = self._connected_components(remaining)
         for comp in comps:
             if len(comp) >= 4:
                 add_pattern(
                     "RCLU",
                     comp,
-                    extra={"rule": "component size >= 4 and not line / quadra / block"},
+                    extra={"rule": "component size >= 4 and not row / column / quadra / block"},
                     consume=True,
                 )
 
-        # 10. SB / DBR / DBC / L
+        # 11. SB / DBR / DBC / TBR / TBC / L
         comps = self._connected_components(remaining)
         for comp in comps:
             if self._is_sb(comp):
@@ -312,13 +368,17 @@ class SRAMPatternClassifier:
                 add_pattern("DBR", comp, consume=True)
             elif self._is_dbc(comp):
                 add_pattern("DBC", comp, consume=True)
+            elif self._is_tbr(comp):
+                add_pattern("TBR", comp, consume=True)
+            elif self._is_tbc(comp):
+                add_pattern("TBC", comp, consume=True)
             elif self._is_l_shape(comp):
                 add_pattern("L", comp, consume=True)
             else:
                 add_pattern("UNCL", comp, consume=True)
 
-        # 11. RANDOM_DENSITY
-        random_like_codes = set(["SB", "DBR", "DBC", "QB", "L", "RCLU"])
+        # 12. RANDOM_DENSITY
+        random_like_codes = set(["SB", "DBR", "DBC", "TBR", "TBC", "QB", "L", "RCLU"])
         random_like_count = 0
         for r in pattern_rows:
             if r["pattern_code"] in random_like_codes:
@@ -331,7 +391,7 @@ class SRAMPatternClassifier:
                 extra={
                     "random_like_component_count": random_like_count,
                     "threshold": self.random_density_threshold,
-                    "rule": "SB/DBR/DBC/QB/L/RANDOM_CLUSTER component count exceeds threshold",
+                    "rule": "SB/DBR/DBC/TBR/TBC/QB/L/RANDOM_CLUSTER component count exceeds threshold",
                 },
                 consume=False,
             )
@@ -350,12 +410,8 @@ class SRAMPatternClassifier:
     # -----------------------------
     # Pattern ID
     # -----------------------------
-    def _make_pattern_id(self, group_info, index, code):
-        keys = []
-        for k in ["lot_id", "wafer_id", "diex", "diey", "macro", "testname", "condition"]:
-            if k in group_info:
-                keys.append(str(group_info[k]))
-        return "%s_%s_%04d" % ("|".join(keys), code, index)
+    def _make_pattern_id(self, index):
+        return index
 
     # -----------------------------
     # Connected component
@@ -810,6 +866,131 @@ class SRAMPatternClassifier:
 
         return groups
 
+    def _line_pattern_strength(self, pattern):
+        range_span = pattern["range_max"] - pattern["range_min"] + 1
+        line_span = pattern["line_max"] - pattern["line_min"] + 1
+
+        return (range_span, len(pattern["points"]), line_span)
+
+    def _detect_dotted_line_patterns(self, points):
+        points = set(points)
+        if not points:
+            return []
+
+        row_map = defaultdict(list)
+        col_map = defaultdict(list)
+        row_component_count = defaultdict(int)
+        col_component_count = defaultdict(int)
+
+        for x, y in points:
+            row_map[y].append(x)
+            col_map[x].append(y)
+
+        for comp in self._connected_components(points):
+            for y in set(p[1] for p in comp):
+                row_component_count[y] += 1
+            for x in set(p[0] for p in comp):
+                col_component_count[x] += 1
+
+        row_items = []
+        for y, xs in row_map.items():
+            item = self._dotted_line_item(
+                line=y,
+                values=xs,
+                axis="WL",
+                component_count=row_component_count[y],
+                kind="DWR",
+            )
+            if item is not None:
+                item["points"] = [(x, y) for x in sorted(set(xs))]
+                row_items.append(item)
+
+        col_items = []
+        for x, ys in col_map.items():
+            item = self._dotted_line_item(
+                line=x,
+                values=ys,
+                axis="BL",
+                component_count=col_component_count[x],
+                kind="DWC",
+            )
+            if item is not None:
+                item["points"] = [(x, y) for y in sorted(set(ys))]
+                col_items.append(item)
+
+        patterns = []
+        for group in self._group_adjacent_lines(row_items):
+            pts = []
+            lines = []
+            for item in group:
+                pts.extend(item["points"])
+                lines.append(item["line"])
+
+            patterns.append({
+                "kind": "DWR",
+                "points": sorted(set(pts)),
+                "extra": {
+                    "axis": "WL",
+                    "line_start": min(lines),
+                    "line_end": max(lines),
+                    "line_count": len(lines),
+                    "rule": "same or adjacent WL has sparse clusters over a long span",
+                },
+            })
+
+        for group in self._group_adjacent_lines(col_items):
+            pts = []
+            lines = []
+            for item in group:
+                pts.extend(item["points"])
+                lines.append(item["line"])
+
+            patterns.append({
+                "kind": "DWC",
+                "points": sorted(set(pts)),
+                "extra": {
+                    "axis": "BL",
+                    "line_start": min(lines),
+                    "line_end": max(lines),
+                    "line_count": len(lines),
+                    "rule": "same or adjacent BL has sparse clusters over a long span",
+                },
+            })
+
+        return sorted(patterns, key=lambda d: len(d["points"]), reverse=True)
+
+    def _dotted_line_item(self, line, values, axis, component_count, kind):
+        values = sorted(set(values))
+        if len(values) < self.dotted_min_points:
+            return None
+
+        span = values[-1] - values[0] + 1
+        if span < self.dotted_min_span:
+            return None
+
+        if component_count < 3:
+            return None
+
+        max_segment_len = max(len(seg) for seg in self._continuous_segments(values))
+        if max_segment_len > self.partial_min_len:
+            return None
+
+        return {
+            "kind": kind,
+            "line": line,
+            "range_min": values[0],
+            "range_max": values[-1],
+            "extra": {
+                "axis": axis,
+                "line": line,
+                "point_count": len(values),
+                "component_count": component_count,
+                "span": span,
+                "max_segment_len": max_segment_len,
+                "rule": "sparse non-continuous points/clusters form a visual dotted line",
+            },
+        }
+
     def _detect_cross_patterns(self, row_patterns, col_patterns):
         cross = []
 
@@ -820,15 +1001,38 @@ class SRAMPatternClassifier:
                 cset = set(cp["points"])
                 inter = rset.intersection(cset)
 
-                if inter:
-                    pts = sorted(rset.union(cset))
-                    cross.append({
-                        "row_id": rp["id"],
-                        "col_id": cp["id"],
-                        "row_kind": rp["kind"],
-                        "col_kind": cp["kind"],
-                        "points": pts,
-                    })
+                if not inter:
+                    continue
+
+                row_arm_span = self._line_arm_span(
+                    rset,
+                    axis="WL",
+                    crossing_min=cp["line_min"],
+                    crossing_max=cp["line_max"],
+                )
+                col_arm_span = self._line_arm_span(
+                    cset,
+                    axis="BL",
+                    crossing_min=rp["line_min"],
+                    crossing_max=rp["line_max"],
+                )
+
+                if row_arm_span < self.cross_min_arm_len:
+                    continue
+
+                if col_arm_span < self.cross_min_arm_len:
+                    continue
+
+                pts = sorted(rset.union(cset))
+                cross.append({
+                    "row_id": rp["id"],
+                    "col_id": cp["id"],
+                    "row_kind": rp["kind"],
+                    "col_kind": cp["kind"],
+                    "points": pts,
+                    "row_arm_span": row_arm_span,
+                    "col_arm_span": col_arm_span,
+                })
 
         # avoid duplicate cross patterns that share exactly the same points
         unique = []
@@ -842,6 +1046,17 @@ class SRAMPatternClassifier:
             unique.append(c)
 
         return unique
+
+    def _line_arm_span(self, points, axis, crossing_min, crossing_max):
+        if axis == "WL":
+            values = [x for x, _ in points if x < crossing_min or x > crossing_max]
+        else:
+            values = [y for _, y in points if y < crossing_min or y > crossing_max]
+
+        if not values:
+            return 0
+
+        return max(values) - min(values) + 1
 
     # -----------------------------
     # BLOCK / QB / Small shape
@@ -941,6 +1156,24 @@ class SRAMPatternClassifier:
 
         return x1 == x2 and abs(y1 - y2) == 1
 
+    def _is_tbr(self, comp):
+        if len(comp) != 3:
+            return False
+
+        xs = sorted(p[0] for p in comp)
+        ys = set(p[1] for p in comp)
+
+        return len(ys) == 1 and xs == list(range(xs[0], xs[0] + 3))
+
+    def _is_tbc(self, comp):
+        if len(comp) != 3:
+            return False
+
+        xs = set(p[0] for p in comp)
+        ys = sorted(p[1] for p in comp)
+
+        return len(xs) == 1 and ys == list(range(ys[0], ys[0] + 3))
+
     def _is_l_shape(self, comp):
         if len(comp) != 3:
             return False
@@ -959,19 +1192,21 @@ class SRAMPatternClassifier:
 def read_input(path):
     ext = os.path.splitext(path)[1].lower()
 
-    if ext in [".xlsx", ".xls"]:
-        return pd.read_excel(path)
-
-    if ext in [".csv", ".txt"]:
+    if ext == ".csv":
         return pd.read_csv(path)
 
-    raise ValueError("Unsupported file type: %s" % ext)
+    raise ValueError("Unsupported file type: %s. Please use a csv file." % ext)
+
+
+def default_outdir(input_path):
+    input_dir = os.path.dirname(os.path.abspath(input_path))
+    return os.path.join(input_dir, RESULT_DIR_NAME)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input", help="input csv/xlsx file")
-    parser.add_argument("--outdir", default="output", help="output directory")
+    parser.add_argument("input", nargs="?", default=INPUT_PATH, help="input csv file")
+    parser.add_argument("--outdir", default=None, help="output directory")
 
     parser.add_argument("--macro-cols", type=int, default=512)
     parser.add_argument("--macro-rows", type=int, default=512)
@@ -980,8 +1215,11 @@ def main():
     parser.add_argument("--swr-ratio", type=float, default=0.40)
     parser.add_argument("--sbc-ratio", type=float, default=0.40)
     parser.add_argument("--partial-min-len", type=int, default=5)
+    parser.add_argument("--cross-min-arm-len", type=int, default=0)
+    parser.add_argument("--dotted-min-points", type=int, default=6)
+    parser.add_argument("--dotted-min-span", type=int, default=20)
 
-    parser.add_argument("--block-min-size", type=int, default=15)
+    parser.add_argument("--block-min-size", type=int, default=25)
     parser.add_argument("--block-fill-ratio", type=float, default=0.60)
 
     parser.add_argument("--periodic-min-points", type=int, default=5)
@@ -989,11 +1227,14 @@ def main():
     parser.add_argument("--periodic-offset-tol", type=int, default=1)
     parser.add_argument("--periodic-min-lines", type=int, default=1)
 
-    parser.add_argument("--random-density-threshold", type=int, default=100)
+    parser.add_argument("--random-density-threshold", type=int, default=200)
 
     args = parser.parse_args()
 
-    df = read_input(args.input)
+    input_path = args.input
+    outdir = args.outdir or default_outdir(input_path)
+
+    df = read_input(input_path)
 
     clf = SRAMPatternClassifier(
         macro_cols=args.macro_cols,
@@ -1002,6 +1243,9 @@ def main():
         swr_ratio=args.swr_ratio,
         sbc_ratio=args.sbc_ratio,
         partial_min_len=args.partial_min_len,
+        cross_min_arm_len=args.cross_min_arm_len,
+        dotted_min_points=args.dotted_min_points,
+        dotted_min_span=args.dotted_min_span,
         block_min_size=args.block_min_size,
         block_fill_ratio=args.block_fill_ratio,
         periodic_min_points=args.periodic_min_points,
@@ -1013,15 +1257,16 @@ def main():
 
     summary_df, labeled_df = clf.classify_dataframe(df)
 
-    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)
 
-    summary_path = os.path.join(args.outdir, "pattern_summary.csv")
-    labeled_path = os.path.join(args.outdir, "failbit_labeled.csv")
+    summary_path = os.path.join(outdir, "pattern_summary.csv")
+    labeled_path = os.path.join(outdir, "failbit_labeled.csv")
 
     summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
     labeled_df.to_csv(labeled_path, index=False, encoding="utf-8-sig")
 
     print("Done.")
+    print("Input:", input_path)
     print("Pattern summary:", summary_path)
     print("Failbit labeled:", labeled_path)
 
