@@ -1,6 +1,6 @@
 你现在可以这样跑：
 
-python sram_pattern_classifier.py failbit.csv --outdir result
+python SRAM_FBM_Classifier.py "D:\00 My Work\09 Programming\log_parser\T5833_parser\FBM\AS00706_55HV_277_normal_failbit.csv" --outdir result
 
 如果你的 macro 是 512 × 512：
 
@@ -25,3 +25,10 @@ QUADRA_BIT
 RANDOM_CLUSTER
 SB / DBR / DBC / L-shape
 RANDOM_DENSITY
+
+![1778067698989](image/note/1778067698989.png)![1778067728560](image/note/1778067728560.png)![1778068117500](image/note/1778068117500.png)
+
+![1778068129443](image/note/1778068129443.png)
+
+
+![1778068285631](image/note/1778068285631.png)
