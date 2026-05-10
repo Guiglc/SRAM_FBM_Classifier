@@ -11,7 +11,7 @@
 
 import argparse
 import os
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 
 import pandas as pd
 
@@ -41,7 +41,7 @@ class SRAMPatternClassifier:
         macro_block_ratio=0.30,
         swr_ratio=0.40,
         sbc_ratio=0.40,
-        partial_min_len=5,
+        partial_min_len=20,
         cross_min_arm_len=0,
         dotted_min_points=6,
         dotted_min_span=20,
@@ -49,10 +49,6 @@ class SRAMPatternClassifier:
         block_aspect_low=0.8,
         block_aspect_high=1.2,
         block_fill_ratio=0.60,
-        periodic_min_points=5,
-        periodic_ratio=0.70,
-        periodic_offset_tol=1,
-        periodic_min_lines=1,
         random_density_threshold=200,
         connectivity=8,
     ):
@@ -72,17 +68,11 @@ class SRAMPatternClassifier:
         self.block_aspect_high = block_aspect_high
         self.block_fill_ratio = block_fill_ratio
 
-        self.periodic_min_points = periodic_min_points
-        self.periodic_ratio = periodic_ratio
-        self.periodic_offset_tol = periodic_offset_tol
-        self.periodic_min_lines = periodic_min_lines
-
         self.random_density_threshold = random_density_threshold
         self.connectivity = connectivity
 
         self.pattern_defs = {
             "MBLK" : ( "MACRO_BLOCK"    , 1  , "BLOCK"       ) ,
-            "PDIC" : ( "PERIODIC"       , 2  , "GEOMETRY"    ) ,
             "SWR"  : ( "SWR"            , 3  , "LINE-ROW"    ) ,
             "SBC"  : ( "SBC"            , 3  , "LINE-COLUMN" ) ,
             "PWR"  : ( "PWR"            , 4  , "LINE-ROW"    ) ,
@@ -98,9 +88,7 @@ class SRAMPatternClassifier:
             "SB"   : ( "SB"             , 10 , "SINGLE"      ) ,
             "DBR"  : ( "DBR"            , 10 , "LINE-DOUBLE" ) ,
             "DBC"  : ( "DBC"            , 10 , "LINE-DOUBLE" ) ,
-            "TBR"  : ( "TBR"            , 10 , "LINE-TRIPLE" ) ,
-            "TBC"  : ( "TBC"            , 10 , "LINE-TRIPLE" ) ,
-            "L"    : ( "L-shape"        , 10 , "L-shape"     ) ,
+            "TB"   : ( "TB"             , 10 , "TB"          ) ,
             "RDEN" : ( "RANDOM_DENSITY" , 11 , "RANDOM"      ) ,
             "UNCL" : ( "UNCLASSIFIED"   , 99 , "UNKNOWN"     ) ,
         }
@@ -258,25 +246,7 @@ class SRAMPatternClassifier:
                     consume=True,
                 )
 
-        # 2. PERIODIC
-        periodic_groups = self._detect_periodic_groups(remaining)
-        for pg in periodic_groups:
-            add_pattern(
-                "PDIC",
-                pg["points"],
-                extra={
-                    "axis": pg["axis"],
-                    "period": pg["period"],
-                    "offset": pg["offset"],
-                    "line_start": min(pg["lines"]),
-                    "line_end": max(pg["lines"]),
-                    "line_count": len(pg["lines"]),
-                    "rule": "single WL/BL periodic, then adjacent periodic lines merged",
-                },
-                consume=True,
-            )
-
-        # 3-6. LINE and CROSS
+        # 2-5. LINE and CROSS
         line_patterns = self._detect_line_patterns(remaining)
 
         row_patterns = [p for p in line_patterns if p["kind"] in ("SWR", "PWR", "MWR")]
@@ -318,7 +288,7 @@ class SRAMPatternClassifier:
                 consume=True,
             )
 
-        # 7. BLOCK
+        # 6. BLOCK
         comps = self._connected_components(remaining)
         for comp in comps:
             if self._is_block(comp):
@@ -329,7 +299,7 @@ class SRAMPatternClassifier:
                     consume=True,
                 )
 
-        # 8. DOTTED LINE
+        # 7. DOTTED LINE
         dotted_patterns = self._detect_dotted_line_patterns(remaining)
         for dp in dotted_patterns:
             if any(p not in remaining for p in dp["points"]):
@@ -342,24 +312,24 @@ class SRAMPatternClassifier:
                 consume=True,
             )
 
-        # 9. QUADRA_BIT
+        # 8. QUADRA_BIT
         comps = self._connected_components(remaining)
         for comp in comps:
             if self._is_quadra_bit(comp):
                 add_pattern("QB", comp, consume=True)
 
-        # 10. RANDOM_CLUSTER
+        # 9. RANDOM_CLUSTER
         comps = self._connected_components(remaining)
         for comp in comps:
-            if len(comp) >= 4:
+            if len(comp) >= 3 and not self._is_l_shape(comp):
                 add_pattern(
                     "RCLU",
                     comp,
-                    extra={"rule": "component size >= 4 and not row / column / quadra / block"},
+                    extra={"rule": "component size >= 3 and not row / column / quadra / block / TB"},
                     consume=True,
                 )
 
-        # 11. SB / DBR / DBC / TBR / TBC / L
+        # 10. SB / DBR / DBC / TB
         comps = self._connected_components(remaining)
         for comp in comps:
             if self._is_sb(comp):
@@ -368,33 +338,13 @@ class SRAMPatternClassifier:
                 add_pattern("DBR", comp, consume=True)
             elif self._is_dbc(comp):
                 add_pattern("DBC", comp, consume=True)
-            elif self._is_tbr(comp):
-                add_pattern("TBR", comp, consume=True)
-            elif self._is_tbc(comp):
-                add_pattern("TBC", comp, consume=True)
             elif self._is_l_shape(comp):
-                add_pattern("L", comp, consume=True)
+                add_pattern("TB", comp, consume=True)
             else:
                 add_pattern("UNCL", comp, consume=True)
 
-        # 12. RANDOM_DENSITY
-        random_like_codes = set(["SB", "DBR", "DBC", "TBR", "TBC", "QB", "L", "RCLU"])
-        random_like_count = 0
-        for r in pattern_rows:
-            if r["pattern_code"] in random_like_codes:
-                random_like_count += 1
-
-        if random_like_count > self.random_density_threshold:
-            add_pattern(
-                "RDEN",
-                [],
-                extra={
-                    "random_like_component_count": random_like_count,
-                    "threshold": self.random_density_threshold,
-                    "rule": "SB/DBR/DBC/TBR/TBC/QB/L/RANDOM_CLUSTER component count exceeds threshold",
-                },
-                consume=False,
-            )
+        # 11. RANDOM_DENSITY
+        self._apply_random_density(pattern_rows, point_label_map)
 
         return pattern_rows, point_label_map
 
@@ -412,6 +362,34 @@ class SRAMPatternClassifier:
     # -----------------------------
     def _make_pattern_id(self, index):
         return index
+
+    def _apply_random_density(self, pattern_rows, point_label_map):
+        random_like_codes = set(["SB", "DBR", "DBC", "QB", "TB", "RCLU"])
+        random_like_rows = [r for r in pattern_rows if r["pattern_code"] in random_like_codes]
+        random_like_count = len(random_like_rows)
+
+        if random_like_count <= self.random_density_threshold:
+            return
+
+        name, priority, level1 = self.pattern_defs["RDEN"]
+        covered_pattern_ids = set()
+
+        for row in random_like_rows:
+            covered_pattern_ids.add(row["pattern_id"])
+            row["original_pattern_name"] = row["pattern_name"]
+            row["original_pattern_code"] = row["pattern_code"]
+            row["pattern_name"] = name
+            row["pattern_code"] = "RDEN"
+            row["priority"] = priority
+            row["level1"] = level1
+            row["random_like_component_count"] = random_like_count
+            row["threshold"] = self.random_density_threshold
+            row["rule"] = "SB/DBR/DBC/QB/TB/RANDOM_CLUSTER component count exceeds threshold"
+
+        for item in point_label_map.values():
+            if item["pattern_id"] in covered_pattern_ids:
+                item["name"] = name
+                item["code"] = "RDEN"
 
     # -----------------------------
     # Connected component
@@ -466,148 +444,6 @@ class SRAMPatternClassifier:
             comps.append(comp)
 
         return comps
-
-    # -----------------------------
-    # PERIODIC
-    # -----------------------------
-    def _detect_periodic_groups(self, points):
-        points = set(points)
-
-        row_map = defaultdict(list)
-        col_map = defaultdict(list)
-
-        for x, y in points:
-            row_map[y].append(x)
-            col_map[x].append(y)
-
-        periodic_lines = []
-
-        # axis = WL means: within the same WL, x direction is periodic
-        for y, xs in row_map.items():
-            result = self._detect_period_in_values(xs)
-            if result is not None:
-                period, offset, selected_values, ratio = result
-                pts = [(x, y) for x in selected_values if (x, y) in points]
-                if pts:
-                    periodic_lines.append({
-                        "axis": "WL",
-                        "line": y,
-                        "period": period,
-                        "offset": offset,
-                        "ratio": ratio,
-                        "points": pts,
-                    })
-
-        # axis = BL means: within the same BL, y direction is periodic
-        for x, ys in col_map.items():
-            result = self._detect_period_in_values(ys)
-            if result is not None:
-                period, offset, selected_values, ratio = result
-                pts = [(x, y) for y in selected_values if (x, y) in points]
-                if pts:
-                    periodic_lines.append({
-                        "axis": "BL",
-                        "line": x,
-                        "period": period,
-                        "offset": offset,
-                        "ratio": ratio,
-                        "points": pts,
-                    })
-
-        groups = []
-        by_axis = defaultdict(list)
-
-        for line in periodic_lines:
-            by_axis[line["axis"]].append(line)
-
-        for axis, lines in by_axis.items():
-            lines = sorted(lines, key=lambda d: d["line"])
-
-            current = None
-
-            for line in lines:
-                if current is None:
-                    current = {
-                        "axis": axis,
-                        "period": line["period"],
-                        "offset": line["offset"],
-                        "lines": [line["line"]],
-                        "points": list(line["points"]),
-                    }
-                    continue
-
-                prev_line = current["lines"][-1]
-                same_period = line["period"] == current["period"]
-                adjacent_line = line["line"] == prev_line + 1
-                offset_close = self._offset_close(
-                    current["offset"],
-                    line["offset"],
-                    current["period"],
-                    self.periodic_offset_tol,
-                )
-
-                if same_period and adjacent_line and offset_close:
-                    current["lines"].append(line["line"])
-                    current["points"].extend(line["points"])
-                else:
-                    if len(current["lines"]) >= self.periodic_min_lines:
-                        groups.append(current)
-
-                    current = {
-                        "axis": axis,
-                        "period": line["period"],
-                        "offset": line["offset"],
-                        "lines": [line["line"]],
-                        "points": list(line["points"]),
-                    }
-
-            if current is not None and len(current["lines"]) >= self.periodic_min_lines:
-                groups.append(current)
-
-        return groups
-
-    def _detect_period_in_values(self, values):
-        values = sorted(set(int(v) for v in values))
-
-        if len(values) < self.periodic_min_points:
-            return None
-
-        diffs = []
-        for i in range(1, len(values)):
-            d = values[i] - values[i - 1]
-            if d > 1:
-                diffs.append(d)
-
-        if not diffs:
-            return None
-
-        cnt = Counter(diffs)
-        period, main_count = cnt.most_common(1)[0]
-
-        if period <= 1:
-            return None
-
-        ratio = main_count / float(len(values) - 1)
-
-        if ratio < self.periodic_ratio:
-            return None
-
-        offset = values[0] % period
-
-        selected_values = []
-        for v in values:
-            if self._offset_close(offset, v % period, period, self.periodic_offset_tol):
-                selected_values.append(v)
-
-        if len(selected_values) < self.periodic_min_points:
-            return None
-
-        return period, offset, selected_values, ratio
-
-    def _offset_close(self, a, b, period, tol):
-        diff = abs(a - b)
-        diff = min(diff, period - diff)
-        return diff <= tol
 
     # -----------------------------
     # LINE / CROSS
@@ -1156,24 +992,6 @@ class SRAMPatternClassifier:
 
         return x1 == x2 and abs(y1 - y2) == 1
 
-    def _is_tbr(self, comp):
-        if len(comp) != 3:
-            return False
-
-        xs = sorted(p[0] for p in comp)
-        ys = set(p[1] for p in comp)
-
-        return len(ys) == 1 and xs == list(range(xs[0], xs[0] + 3))
-
-    def _is_tbc(self, comp):
-        if len(comp) != 3:
-            return False
-
-        xs = set(p[0] for p in comp)
-        ys = sorted(p[1] for p in comp)
-
-        return len(xs) == 1 and ys == list(range(ys[0], ys[0] + 3))
-
     def _is_l_shape(self, comp):
         if len(comp) != 3:
             return False
@@ -1214,18 +1032,13 @@ def main():
     parser.add_argument("--macro-block-ratio", type=float, default=0.30)
     parser.add_argument("--swr-ratio", type=float, default=0.40)
     parser.add_argument("--sbc-ratio", type=float, default=0.40)
-    parser.add_argument("--partial-min-len", type=int, default=5)
+    parser.add_argument("--partial-min-len", type=int, default=20)
     parser.add_argument("--cross-min-arm-len", type=int, default=0)
     parser.add_argument("--dotted-min-points", type=int, default=6)
     parser.add_argument("--dotted-min-span", type=int, default=20)
 
     parser.add_argument("--block-min-size", type=int, default=25)
     parser.add_argument("--block-fill-ratio", type=float, default=0.60)
-
-    parser.add_argument("--periodic-min-points", type=int, default=5)
-    parser.add_argument("--periodic-ratio", type=float, default=0.70)
-    parser.add_argument("--periodic-offset-tol", type=int, default=1)
-    parser.add_argument("--periodic-min-lines", type=int, default=1)
 
     parser.add_argument("--random-density-threshold", type=int, default=200)
 
@@ -1248,10 +1061,6 @@ def main():
         dotted_min_span=args.dotted_min_span,
         block_min_size=args.block_min_size,
         block_fill_ratio=args.block_fill_ratio,
-        periodic_min_points=args.periodic_min_points,
-        periodic_ratio=args.periodic_ratio,
-        periodic_offset_tol=args.periodic_offset_tol,
-        periodic_min_lines=args.periodic_min_lines,
         random_density_threshold=args.random_density_threshold,
     )
 
