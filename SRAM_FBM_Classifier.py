@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 import pandas as pd
 
 
-INPUT_PATH = r"D:\00 My Work\09 Programming\log_parser\J750_parser\Bitmap\FT0016_303_norm_fail_bitmap.csv"
+INPUT_PATH = r"E:\Programming\Project\SRAM_Classifier\AS00706_55HV_277_normal_failbit.csv"
 RESULT_DIR_NAME = "result"
 
 
@@ -42,7 +42,7 @@ class SRAMPatternClassifier:
         swr_ratio=0.40,
         sbc_ratio=0.40,
         partial_min_len=20,
-        cross_min_arm_len=0,
+        cross_min_arm_len=20,
         dotted_min_points=6,
         dotted_min_span=20,
         block_min_size=25,
@@ -50,6 +50,8 @@ class SRAMPatternClassifier:
         block_aspect_high=1.2,
         block_fill_ratio=0.60,
         random_density_threshold=200,
+        random_density_min_span_ratio=0.30,
+        random_density_max_gap=100,
         connectivity=8,
     ):
         self.macro_cols = macro_cols
@@ -69,28 +71,30 @@ class SRAMPatternClassifier:
         self.block_fill_ratio = block_fill_ratio
 
         self.random_density_threshold = random_density_threshold
+        self.random_density_min_span_ratio = random_density_min_span_ratio
+        self.random_density_max_gap = random_density_max_gap
         self.connectivity = connectivity
 
         self.pattern_defs = {
-            "MBLK" : ( "MACRO_BLOCK"    , 1  , "BLOCK"       ) ,
-            "SWR"  : ( "SWR"            , 3  , "LINE-ROW"    ) ,
-            "SBC"  : ( "SBC"            , 3  , "LINE-COLUMN" ) ,
-            "PWR"  : ( "PWR"            , 4  , "LINE-ROW"    ) ,
-            "PBC"  : ( "PBC"            , 4  , "LINE-COLUMN" ) ,
-            "MWR"  : ( "MWR"            , 5  , "LINE-ROW"    ) ,
-            "MBC"  : ( "MBC"            , 5  , "LINE-COLUMN" ) ,
-            "CRS"  : ( "CROSS"          , 6  , "CROSS"       ) ,
-            "BLK"  : ( "BLOCK"          , 7  , "BLOCK"       ) ,
-            "QB"   : ( "QUADRA_BIT"     , 8  , "BLOCK"       ) ,
-            "RCLU" : ( "RANDOM_CLUSTER" , 9  , "RANDOM"      ) ,
-            "DWR"  : ( "DOTTED_ROW"     , 9  , "LINE-ROW"    ) ,
-            "DWC"  : ( "DOTTED_COLUMN"  , 9  , "LINE-COLUMN" ) ,
-            "SB"   : ( "SB"             , 10 , "SINGLE"      ) ,
-            "DBR"  : ( "DBR"            , 10 , "LINE-DOUBLE" ) ,
-            "DBC"  : ( "DBC"            , 10 , "LINE-DOUBLE" ) ,
-            "TB"   : ( "TB"             , 10 , "TB"          ) ,
-            "RDEN" : ( "RANDOM_DENSITY" , 11 , "RANDOM"      ) ,
-            "UNCL" : ( "UNCLASSIFIED"   , 99 , "UNKNOWN"     ) ,
+            "MBLK" : ( "MACRO_BLOCK"    , 1  ) ,
+            "SWR"  : ( "SWR"            , 3  ) ,
+            "SBC"  : ( "SBC"            , 3  ) ,
+            "PWR"  : ( "PWR"            , 4  ) ,
+            "PBC"  : ( "PBC"            , 4  ) ,
+            "MWR"  : ( "MWR"            , 5  ) ,
+            "MBC"  : ( "MBC"            , 5  ) ,
+            "CRS"  : ( "CROSS"          , 6  ) ,
+            "BLK"  : ( "BLOCK"          , 7  ) ,
+            "QB"   : ( "QUADRA_BIT"     , 8  ) ,
+            "RCLU" : ( "RANDOM_CLUSTER" , 9  ) ,
+            "DWR"  : ( "DOTTED_ROW"     , 9  ) ,
+            "DWC"  : ( "DOTTED_COLUMN"  , 9  ) ,
+            "SB"   : ( "SB"             , 10 ) ,
+            "DBR"  : ( "DBR"            , 10 ) ,
+            "DBC"  : ( "DBC"            , 10 ) ,
+            "TB"   : ( "TB"             , 10 ) ,
+            "RDEN" : ( "RANDOM_DENSITY" , 11 ) ,
+            "UNCL" : ( "UNCLASSIFIED"   , 99 ) ,
         }
 
     # -----------------------------
@@ -192,7 +196,7 @@ class SRAMPatternClassifier:
             if not pts and code != "RDEN":
                 return None
 
-            name, priority, level1 = self.pattern_defs[code]
+            name, priority = self.pattern_defs[code]
             pattern_id = self._make_pattern_id(pattern_index)
             pattern_index += 1
 
@@ -204,7 +208,6 @@ class SRAMPatternClassifier:
             row.update({
                 "pattern_id": pattern_id,
                 "priority": priority,
-                "level1": level1,
                 "pattern_name": name,
                 "pattern_code": code,
                 "fail_count": len(pts),
@@ -265,7 +268,12 @@ class SRAMPatternClassifier:
                     "col_pattern": cp["col_kind"],
                     "row_arm_span": cp["row_arm_span"],
                     "col_arm_span": cp["col_arm_span"],
-                    "rule": "SWR/PWR/MWR intersects SBC/PBC/MBC",
+                    "row_left_arm": cp["row_left_arm"],
+                    "row_right_arm": cp["row_right_arm"],
+                    "col_down_arm": cp["col_down_arm"],
+                    "col_up_arm": cp["col_up_arm"],
+                    "cross_count": cp["cross_count"],
+                    "rule": "row/column patterns intersect with two-sided arms around the crossing",
                 },
                 consume=True,
             )
@@ -278,13 +286,14 @@ class SRAMPatternClassifier:
             if lp["id"] in used_line_pattern_ids:
                 continue
 
-            if any(p not in remaining for p in lp["points"]):
+            line_points = self._remaining_line_points(lp, remaining)
+            if not line_points:
                 continue
 
             add_pattern(
                 lp["kind"],
-                lp["points"],
-                extra=lp.get("extra"),
+                line_points,
+                extra=self._line_extra_with_overlap(lp, line_points),
                 consume=True,
             )
 
@@ -364,32 +373,137 @@ class SRAMPatternClassifier:
         return index
 
     def _apply_random_density(self, pattern_rows, point_label_map):
-        random_like_codes = set(["SB", "DBR", "DBC", "QB", "TB", "RCLU"])
+        random_like_codes = set(["SB", "DBR", "DBC", "QB", "TB", "RCLU", "DWR", "DWC"])
         random_like_rows = [r for r in pattern_rows if r["pattern_code"] in random_like_codes]
-        random_like_count = len(random_like_rows)
+        random_density_groups = self._random_density_groups(random_like_rows)
+        qualified_groups = []
 
-        if random_like_count <= self.random_density_threshold:
+        for group in random_density_groups:
+            random_like_count = len(group)
+            random_like_fail_count = sum(r["fail_count"] for r in group)
+
+            if (
+                random_like_count <= self.random_density_threshold
+                and random_like_fail_count <= self.random_density_threshold
+            ):
+                continue
+
+            spans = self._random_density_group_spans(group)
+            if spans is None:
+                continue
+
+            random_like_x_span, random_like_y_span, min_x_span, min_y_span = spans
+
+            if random_like_x_span <= min_x_span or random_like_y_span <= min_y_span:
+                continue
+
+            qualified_groups.append({
+                "rows": group,
+                "count": random_like_count,
+                "fail_count": random_like_fail_count,
+                "x_span": random_like_x_span,
+                "y_span": random_like_y_span,
+                "min_x_span": min_x_span,
+                "min_y_span": min_y_span,
+            })
+
+        if not qualified_groups:
             return
 
-        name, priority, level1 = self.pattern_defs["RDEN"]
-        covered_pattern_ids = set()
+        name, priority = self.pattern_defs["RDEN"]
+        covered_pattern_id_map = {}
 
-        for row in random_like_rows:
-            covered_pattern_ids.add(row["pattern_id"])
-            row["original_pattern_name"] = row["pattern_name"]
-            row["original_pattern_code"] = row["pattern_code"]
-            row["pattern_name"] = name
-            row["pattern_code"] = "RDEN"
-            row["priority"] = priority
-            row["level1"] = level1
-            row["random_like_component_count"] = random_like_count
-            row["threshold"] = self.random_density_threshold
-            row["rule"] = "SB/DBR/DBC/QB/TB/RANDOM_CLUSTER component count exceeds threshold"
+        for group in qualified_groups:
+            rden_pattern_id = min(row["pattern_id"] for row in group["rows"])
+            for row in group["rows"]:
+                original_pattern_id = row["pattern_id"]
+                covered_pattern_id_map[original_pattern_id] = rden_pattern_id
+                row["original_pattern_id"] = original_pattern_id
+                row["original_pattern_name"] = row["pattern_name"]
+                row["original_pattern_code"] = row["pattern_code"]
+                row["pattern_id"] = rden_pattern_id
+                row["pattern_name"] = name
+                row["pattern_code"] = "RDEN"
+                row["priority"] = priority
+                row["random_like_component_count"] = group["count"]
+                row["random_like_fail_count"] = group["fail_count"]
+                row["random_like_x_span"] = group["x_span"]
+                row["random_like_y_span"] = group["y_span"]
+                row["random_density_min_x_span"] = group["min_x_span"]
+                row["random_density_min_y_span"] = group["min_y_span"]
+                row["random_density_max_gap"] = self.random_density_max_gap
+                row["threshold"] = self.random_density_threshold
+                row["rule"] = "nearby random-like group exceeds count/fail threshold and x/y span threshold"
 
         for item in point_label_map.values():
-            if item["pattern_id"] in covered_pattern_ids:
+            if item["pattern_id"] in covered_pattern_id_map:
+                item["pattern_id"] = covered_pattern_id_map[item["pattern_id"]]
                 item["name"] = name
                 item["code"] = "RDEN"
+
+    def _random_density_groups(self, rows):
+        rows = [r for r in rows if self._row_has_bbox(r)]
+        if not rows:
+            return []
+
+        groups = []
+        visited = set()
+
+        for i, row in enumerate(rows):
+            if i in visited:
+                continue
+
+            visited.add(i)
+            q = deque([i])
+            group = []
+
+            while q:
+                cur = q.popleft()
+                group.append(rows[cur])
+
+                for j, other in enumerate(rows):
+                    if j in visited:
+                        continue
+
+                    if self._bbox_gap(rows[cur], other) <= self.random_density_max_gap:
+                        visited.add(j)
+                        q.append(j)
+
+            groups.append(group)
+
+        return groups
+
+    def _row_has_bbox(self, row):
+        return (
+            row.get("xmin") is not None
+            and row.get("xmax") is not None
+            and row.get("ymin") is not None
+            and row.get("ymax") is not None
+        )
+
+    def _bbox_gap(self, a, b):
+        x_gap = max(0, max(a["xmin"], b["xmin"]) - min(a["xmax"], b["xmax"]))
+        y_gap = max(0, max(a["ymin"], b["ymin"]) - min(a["ymax"], b["ymax"]))
+        return max(x_gap, y_gap)
+
+    def _random_density_group_spans(self, rows):
+        xs = []
+        ys = []
+        for row in rows:
+            if row["xmin"] is not None and row["xmax"] is not None:
+                xs.extend([row["xmin"], row["xmax"]])
+            if row["ymin"] is not None and row["ymax"] is not None:
+                ys.extend([row["ymin"], row["ymax"]])
+
+        if not xs or not ys:
+            return
+
+        random_like_x_span = max(xs) - min(xs) + 1
+        random_like_y_span = max(ys) - min(ys) + 1
+        min_x_span = self.macro_cols * self.random_density_min_span_ratio
+        min_y_span = self.macro_rows * self.random_density_min_span_ratio
+
+        return random_like_x_span, random_like_y_span, min_x_span, min_y_span
 
     # -----------------------------
     # Connected component
@@ -708,6 +822,54 @@ class SRAMPatternClassifier:
 
         return (range_span, len(pattern["points"]), line_span)
 
+    def _remaining_line_points(self, pattern, remaining):
+        points = sorted(p for p in pattern["points"] if p in remaining)
+        if not points:
+            return []
+
+        kind = pattern["kind"]
+
+        if kind in ("SWR", "PWR", "MWR"):
+            line_map = defaultdict(list)
+            for x, y in points:
+                line_map[y].append(x)
+            if any(self._has_long_segment(xs) for xs in line_map.values()):
+                return points
+            if kind == "SWR" and len(points) / float(self.macro_cols) >= self.swr_ratio:
+                return points
+            return []
+
+        if kind in ("SBC", "PBC", "MBC"):
+            line_map = defaultdict(list)
+            for x, y in points:
+                line_map[x].append(y)
+            if any(self._has_long_segment(ys) for ys in line_map.values()):
+                return points
+            if kind == "SBC" and len(points) / float(self.macro_rows) >= self.sbc_ratio:
+                return points
+            return []
+
+        return points
+
+    def _has_long_segment(self, values):
+        return any(len(seg) > self.partial_min_len for seg in self._continuous_segments(values))
+
+    def _line_extra_with_overlap(self, pattern, points):
+        extra = {}
+        if pattern.get("extra"):
+            extra.update(pattern["extra"])
+
+        original_count = len(pattern["points"])
+        remaining_count = len(points)
+        overlap_count = original_count - remaining_count
+
+        if overlap_count > 0:
+            extra["original_line_fail_count"] = original_count
+            extra["overlap_consumed_count"] = overlap_count
+            extra["rule"] = extra.get("rule", "") + "; kept remaining line points after overlap with higher-priority line"
+
+        return extra
+
     def _detect_dotted_line_patterns(self, points):
         points = set(points)
         if not points:
@@ -840,23 +1002,8 @@ class SRAMPatternClassifier:
                 if not inter:
                     continue
 
-                row_arm_span = self._line_arm_span(
-                    rset,
-                    axis="WL",
-                    crossing_min=cp["line_min"],
-                    crossing_max=cp["line_max"],
-                )
-                col_arm_span = self._line_arm_span(
-                    cset,
-                    axis="BL",
-                    crossing_min=rp["line_min"],
-                    crossing_max=rp["line_max"],
-                )
-
-                if row_arm_span < self.cross_min_arm_len:
-                    continue
-
-                if col_arm_span < self.cross_min_arm_len:
+                cross_info = self._valid_crossing(rp, cp, rset, cset, inter)
+                if cross_info is None:
                     continue
 
                 pts = sorted(rset.union(cset))
@@ -866,33 +1013,130 @@ class SRAMPatternClassifier:
                     "row_kind": rp["kind"],
                     "col_kind": cp["kind"],
                     "points": pts,
-                    "row_arm_span": row_arm_span,
-                    "col_arm_span": col_arm_span,
+                    "cross_points": cross_info["cross_points"],
+                    "row_arm_span": cross_info["row_arm_span"],
+                    "col_arm_span": cross_info["col_arm_span"],
+                    "row_left_arm": cross_info["row_left_arm"],
+                    "row_right_arm": cross_info["row_right_arm"],
+                    "col_down_arm": cross_info["col_down_arm"],
+                    "col_up_arm": cross_info["col_up_arm"],
                 })
 
-        # avoid duplicate cross patterns that share exactly the same points
-        unique = []
-        seen = set()
+        return self._merge_cross_patterns(cross)
 
-        for c in cross:
-            key = tuple(c["points"])
-            if key in seen:
+    def _valid_crossing(self, row_pattern, col_pattern, row_points, col_points, inter):
+        valid_cross_points = []
+        best = None
+
+        for x, y in sorted(inter):
+            row_xs = [px for px, py in row_points if py == y]
+            col_ys = [py for px, py in col_points if px == x]
+
+            if not row_xs or not col_ys:
                 continue
-            seen.add(key)
-            unique.append(c)
 
-        return unique
+            row_left = x - min(row_xs)
+            row_right = max(row_xs) - x
+            col_down = y - min(col_ys)
+            col_up = max(col_ys) - y
 
-    def _line_arm_span(self, points, axis, crossing_min, crossing_max):
-        if axis == "WL":
-            values = [x for x, _ in points if x < crossing_min or x > crossing_max]
-        else:
-            values = [y for _, y in points if y < crossing_min or y > crossing_max]
+            if min(row_left, row_right, col_down, col_up) < self.cross_min_arm_len:
+                continue
 
-        if not values:
-            return 0
+            item = {
+                "point": (x, y),
+                "row_left_arm": row_left,
+                "row_right_arm": row_right,
+                "col_down_arm": col_down,
+                "col_up_arm": col_up,
+                "row_arm_span": row_left + row_right + 1,
+                "col_arm_span": col_down + col_up + 1,
+            }
+            valid_cross_points.append((x, y))
 
-        return max(values) - min(values) + 1
+            if best is None:
+                best = item
+            else:
+                best_score = min(
+                    best["row_left_arm"],
+                    best["row_right_arm"],
+                    best["col_down_arm"],
+                    best["col_up_arm"],
+                )
+                item_score = min(row_left, row_right, col_down, col_up)
+                if item_score > best_score:
+                    best = item
+
+        if best is None:
+            return None
+
+        best["cross_points"] = valid_cross_points
+        return best
+
+    def _merge_cross_patterns(self, cross_patterns):
+        if not cross_patterns:
+            return []
+
+        merged = []
+        used = [False] * len(cross_patterns)
+
+        for i, pattern in enumerate(cross_patterns):
+            if used[i]:
+                continue
+
+            used[i] = True
+            group = [pattern]
+            changed = True
+
+            while changed:
+                changed = False
+                group_points = set()
+                group_row_ids = set()
+                group_col_ids = set()
+
+                for item in group:
+                    group_points.update(item["points"])
+                    group_row_ids.add(item["row_id"])
+                    group_col_ids.add(item["col_id"])
+
+                for j, other in enumerate(cross_patterns):
+                    if used[j]:
+                        continue
+
+                    shares_line = (
+                        other["row_id"] in group_row_ids
+                        or other["col_id"] in group_col_ids
+                    )
+                    shares_points = bool(group_points.intersection(other["points"]))
+
+                    if shares_line or shares_points:
+                        used[j] = True
+                        group.append(other)
+                        changed = True
+
+            merged.append(self._merge_cross_group(group))
+
+        return merged
+
+    def _merge_cross_group(self, group):
+        base = group[0].copy()
+        points = set()
+        cross_points = []
+        row_kinds = set()
+        col_kinds = set()
+
+        for item in group:
+            points.update(item["points"])
+            cross_points.extend(item["cross_points"])
+            row_kinds.add(item["row_kind"])
+            col_kinds.add(item["col_kind"])
+
+        base["points"] = sorted(points)
+        base["cross_points"] = sorted(set(cross_points))
+        base["row_kind"] = ",".join(sorted(row_kinds))
+        base["col_kind"] = ",".join(sorted(col_kinds))
+        base["cross_count"] = len(base["cross_points"])
+        return base
 
     # -----------------------------
     # BLOCK / QB / Small shape
@@ -1022,25 +1266,27 @@ def default_outdir(input_path):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input", nargs="?", default=INPUT_PATH, help="input csv file")
-    parser.add_argument("--outdir", default=None, help="output directory")
+    parser = argparse.ArgumentParser(                                 )
+    parser.add_argument             ("input"                          , nargs="?"   , default=INPUT_PATH     , help="input csv file")
+    parser.add_argument             ("--outdir"                       , default=None, help="output directory")
 
-    parser.add_argument("--macro-cols", type=int, default=384)
-    parser.add_argument("--macro-rows", type=int, default=1024)
+    parser.add_argument             ("--macro-cols"                   , type=int    , default=512            )
+    parser.add_argument             ("--macro-rows"                   , type=int    , default=512           )
 
-    parser.add_argument("--macro-block-ratio", type=float, default=0.30)
-    parser.add_argument("--swr-ratio", type=float, default=0.40)
-    parser.add_argument("--sbc-ratio", type=float, default=0.40)
-    parser.add_argument("--partial-min-len", type=int, default=20)
-    parser.add_argument("--cross-min-arm-len", type=int, default=0)
-    parser.add_argument("--dotted-min-points", type=int, default=6)
-    parser.add_argument("--dotted-min-span", type=int, default=20)
+    parser.add_argument             ("--macro-block-ratio"            , type=float  , default=0.30           )
+    parser.add_argument             ("--swr-ratio"                    , type=float  , default=0.40           )
+    parser.add_argument             ("--sbc-ratio"                    , type=float  , default=0.40           )
+    parser.add_argument             ("--partial-min-len"              , type=int    , default=20             )
+    parser.add_argument             ("--cross-min-arm-len"            , type=int    , default=20             )
+    parser.add_argument             ("--dotted-min-points"            , type=int    , default=6              )
+    parser.add_argument             ("--dotted-min-span"              , type=int    , default=20             )
 
-    parser.add_argument("--block-min-size", type=int, default=25)
-    parser.add_argument("--block-fill-ratio", type=float, default=0.60)
+    parser.add_argument             ("--block-min-size"               , type=int    , default=25             )
+    parser.add_argument             ("--block-fill-ratio"             , type=float  , default=0.60           )
 
-    parser.add_argument("--random-density-threshold", type=int, default=200)
+    parser.add_argument             ("--random-density-threshold"     , type=int    , default=200            )
+    parser.add_argument             ("--random-density-min-span-ratio", type=float  , default=0.30           )
+    parser.add_argument             ("--random-density-max-gap"       , type=int    , default=100            )
 
     args = parser.parse_args()
 
@@ -1062,6 +1308,8 @@ def main():
         block_min_size=args.block_min_size,
         block_fill_ratio=args.block_fill_ratio,
         random_density_threshold=args.random_density_threshold,
+        random_density_min_span_ratio=args.random_density_min_span_ratio,
+        random_density_max_gap=args.random_density_max_gap,
     )
 
     summary_df, labeled_df = clf.classify_dataframe(df)
