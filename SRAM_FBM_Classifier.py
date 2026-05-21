@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 import pandas as pd
 
 
-INPUT_PATH = r"E:\Programming\Project\SRAM_Classifier\AS00706_55HV_277_normal_failbit.csv"
+INPUT_PATH = r"D:\00 My Work\09 Programming\log_parser\J750_parser\Bitmap\AS00897_23_303_norm_fail_bitmap.csv"
 RESULT_DIR_NAME = "result"
 
 
@@ -106,12 +106,28 @@ class SRAMPatternClassifier:
 
         self._validate_columns(df)
 
+        # --- Define Macros to Skip ---
+        # Add more dictionaries to this list to skip multiple macros
+        skip_macros = [
+            # {
+                # "lot_id": "FT0001",
+                # "wafer_id": "24",
+                # "diex": 0,      # Note: Ensure types match your data (int vs str)
+                # "diey": 3,
+                # "macro": "23"   # Note: Ensure types match your data (int vs str)
+            # }
+        ]
+        # -----------------------------
+
         all_pattern_rows = []
         all_labeled_rows = []
         grouped = df.groupby(group_cols, dropna=False)
         total_groups = grouped.ngroups
         processed_groups = 0
-        last_progress_percent = 0
+        
+        # Change: Update every 0.1% or every 50 groups to see more frequent updates
+        UPDATE_INTERVAL = max(1, total_groups // 1000) # Update approx 1000 times total
+        last_update_group = 0
 
         if show_progress:
             print("Progress: 0/%d macro (0%%)" % total_groups, end="", flush=True)
@@ -122,6 +138,33 @@ class SRAMPatternClassifier:
                 group_key = (group_key,)
 
             group_info = dict(zip(group_cols, group_key))
+
+            # --- Check if current macro should be skipped ---
+            should_skip = False
+            for skip_criteria in skip_macros:
+                match = True
+                for key, value in skip_criteria.items():
+                    # Handle type conversion if necessary (e.g., int vs str in CSV)
+                    if key in group_info:
+                        if str(group_info[key]) != str(value):
+                            match = False
+                            break
+                    else:
+                        match = False
+                        break
+                if match:
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                if show_progress:
+                    print("\rSkipping: Lot:%s Wafer:%s Die:(%s,%s) Macro:%s" % (
+                        group_info.get("lot_id"), group_info.get("wafer_id"),
+                        group_info.get("diex"), group_info.get("diey"),
+                        group_info.get("macro")
+                    ), end="", flush=True)
+                continue
+            # ----------------------------------------------
 
             pattern_rows, point_label_map = self.classify_one_macro(g, group_info)
 
@@ -151,19 +194,31 @@ class SRAMPatternClassifier:
 
             all_labeled_rows.append(labeled_g)
 
+
             if show_progress:
-                progress_percent = int(processed_groups * 100 / total_groups)
-                if progress_percent != last_progress_percent:
+                # Change: Check interval instead of just percentage integer change
+                if processed_groups - last_update_group >= UPDATE_INTERVAL or processed_groups == total_groups:
+                    progress_percent = int(processed_groups * 100 / total_groups)
+                    
+                    lot = group_info.get("lot_id", "N/A")
+                    wafer = group_info.get("wafer_id", "N/A")
+                    diex = group_info.get("diex", "N/A")
+                    diey = group_info.get("diey", "N/A")
+                    macro = group_info.get("macro", "N/A")
+                    
+                    status_str = "Lot:%s Wafer:%s Die:(%s,%s) Macro:%s" % (lot, wafer, diex, diey, macro)
+                    
                     print(
-                        "\rProgress: %d/%d macro (%d%%)" % (
+                        "\rProgress: %d/%d macro (%d%%) [%s]" % (
                             processed_groups,
                             total_groups,
                             progress_percent,
+                            status_str
                         ),
                         end="",
                         flush=True,
                     )
-                    last_progress_percent = progress_percent
+                    last_update_group = processed_groups
 
         if show_progress:
             print()
@@ -1270,8 +1325,8 @@ def main():
     parser.add_argument             ("input"                          , nargs="?"   , default=INPUT_PATH     , help="input csv file")
     parser.add_argument             ("--outdir"                       , default=None, help="output directory")
 
-    parser.add_argument             ("--macro-cols"                   , type=int    , default=512            )
-    parser.add_argument             ("--macro-rows"                   , type=int    , default=512           )
+    parser.add_argument             ("--macro-cols"                   , type=int    , default=384            )
+    parser.add_argument             ("--macro-rows"                   , type=int    , default=1024           )
 
     parser.add_argument             ("--macro-block-ratio"            , type=float  , default=0.30           )
     parser.add_argument             ("--swr-ratio"                    , type=float  , default=0.40           )
@@ -1329,4 +1384,9 @@ def main():
 
 
 if __name__ == "__main__":
+
+    print("SRAM Pattern Classifier starts...")
+
+    print("Please don't forget to change the macro-cols and macro-rows!")
+
     main()

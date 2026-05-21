@@ -1,1 +1,3 @@
 *.csv
+
+!Special_Macro.csv
