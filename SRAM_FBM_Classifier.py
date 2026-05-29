@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 import pandas as pd
 
 
-INPUT_PATH = r"D:\00 My Work\09 Programming\log_parser\J750_parser\Bitmap\AS00897_23_303_norm_fail_bitmap.csv"
+INPUT_PATH = r"D:\00 My Work\09 Programming\log_parser\J750_parser\Bitmap\40LP_303_FT0016_11_GL_norm_fail_bitmap.csv"
 RESULT_DIR_NAME = "result"
 
 
