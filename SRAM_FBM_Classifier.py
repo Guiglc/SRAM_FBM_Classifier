@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 import pandas as pd
 
 
-INPUT_PATH = r"E:\Programming\Project\SRAM_Classifier\Sample\sample2_SWR.csv"
+INPUT_PATH = r"D:\00 My Work\09 Programming\log_parser\J750_parser\Bitmap\40LP_303_AS01635#08_GL_norm_fail_bitmap.csv"
 RESULT_DIR_NAME = "result"
 
 
@@ -1529,8 +1529,8 @@ def main():
     parser.add_argument             ("input"                          , nargs="?"   , default=INPUT_PATH     , help="input csv file")
     parser.add_argument             ("--outdir"                       , default=None, help="output directory")
 
-    parser.add_argument             ("--macro-cols"                   , type=int    , default=512            )
-    parser.add_argument             ("--macro-rows"                   , type=int    , default=512            )
+    parser.add_argument             ("--macro-cols"                   , type=int    , default=384            )
+    parser.add_argument             ("--macro-rows"                   , type=int    , default=1024           )
 
     parser.add_argument             ("--macro-block-ratio"            , type=float  , default=0.30           )
     parser.add_argument             ("--swr-ratio"                    , type=float  , default=0.25           )
